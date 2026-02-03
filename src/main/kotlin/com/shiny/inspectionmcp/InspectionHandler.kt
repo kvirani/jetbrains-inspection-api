@@ -163,6 +163,7 @@ class InspectionHandler : HttpRequestHandler() {
                     val projectName = urlDecoder.parameters()["project"]?.firstOrNull()
                     val files = urlDecoder.parameters()["file"] ?: emptyList()
                     val severity = urlDecoder.parameters()["severity"]?.firstOrNull() ?: "all"
+                    val format = urlDecoder.parameters()["format"]?.firstOrNull()?.lowercase()?.trim() ?: "md"
                     val timeoutMs = (urlDecoder.parameters()["timeout_ms"]?.firstOrNull()?.toLongOrNull() ?: 30000L)
                         .coerceIn(1000L, 120000L)
                     val limit = urlDecoder.parameters()["limit"]?.firstOrNull()?.toIntOrNull() ?: 200
@@ -177,9 +178,19 @@ class InspectionHandler : HttpRequestHandler() {
                         val project = ReadAction.compute<Project?, Exception> { getCurrentProject(projectName) }
                         if (project == null) {
                             sendJsonResponse(context, """{"error": "No project found"}""", HttpResponseStatus.NOT_FOUND)
+                        } else if (!files.any { resolveAbsolutePath(it, project.basePath).let { p -> File(p).exists() } }) {
+                            sendJsonResponse(
+                                context,
+                                """{"error": "None of the specified files exist on disk"}""",
+                                HttpResponseStatus.BAD_REQUEST
+                            )
                         } else {
-                            val result = analyzeFilesViaHighlights(project, files, severity, timeoutMs, limit, offset)
-                            sendJsonResponse(context, result)
+                            val analyzeResult = analyzeFiles(project, files, severity, timeoutMs)
+                            if (format == "json") {
+                                sendJsonResponse(context, formatAnalyzeResultAsJson(analyzeResult, limit, offset))
+                            } else {
+                                sendResponse(context, formatAnalyzeResultAsMarkdown(analyzeResult), "text/markdown")
+                            }
                         }
                     }
                 }
@@ -1054,66 +1065,171 @@ class InspectionHandler : HttpRequestHandler() {
         )
     }
     
-    private fun analyzeFilesViaHighlights(
+    private data class AnalyzeResult(
+        val projectName: String,
+        val fileResults: List<FileEntry>,
+        val severity: String,
+    ) {
+        data class FileEntry(
+            val rawPath: String,
+            val status: String,
+            val problems: List<Map<String, Any>>,
+        )
+    }
+
+    private fun resolveAbsolutePath(rawPath: String, basePath: String?): String {
+        return try {
+            val p = Paths.get(rawPath)
+            if (p.isAbsolute) rawPath
+            else if (!basePath.isNullOrBlank()) Paths.get(basePath, rawPath).normalize().toString()
+            else rawPath
+        } catch (_: Exception) { rawPath }
+    }
+
+    private fun analyzeFiles(
         project: Project,
         filePaths: List<String>,
         severity: String,
         timeoutMs: Long,
-        limit: Int,
-        offset: Int,
-    ): String {
+    ): AnalyzeResult {
         val basePath = project.basePath
-        val allProblems = mutableListOf<Map<String, Any>>()
-        val fileStatuses = mutableMapOf<String, String>()
-        val seen = LinkedHashSet<String>()
+        val normalizedSeverity = normalizeOptionalFilter(severity)
+        val fileEntries = LinkedHashMap<String, AnalyzeResult.FileEntry>()
+
+        // Phase 1: Triage each file
+        data class ResolvedFile(val rawPath: String, val absolutePath: String)
+        val vfsResolvable = mutableListOf<Pair<ResolvedFile, com.intellij.openapi.vfs.VirtualFile>>()
+        val cliFiles = mutableListOf<ResolvedFile>()
 
         for (rawPath in filePaths) {
-            val absolutePath = try {
-                val p = Paths.get(rawPath)
-                if (p.isAbsolute) rawPath
-                else if (!basePath.isNullOrBlank()) Paths.get(basePath, rawPath).normalize().toString()
-                else rawPath
-            } catch (_: Exception) { rawPath }
+            val absolutePath = resolveAbsolutePath(rawPath, basePath)
+            val file = File(absolutePath)
 
-            try {
-                val result = analyzeOneFile(project, absolutePath, timeoutMs)
-                fileStatuses[rawPath] = result.status
-                for (problem in result.problems) {
-                    val key = listOf(
-                        problem["severity"],
-                        problem["inspectionType"],
-                        problem["file"],
-                        problem["line"],
-                        problem["column"],
-                        problem["description"],
-                    ).joinToString("|")
-                    if (seen.add(key)) {
-                        allProblems.add(problem)
-                    }
-                }
-            } catch (e: Exception) {
-                fileStatuses[rawPath] = "error: ${e.message ?: "unknown"}"
+            if (!file.exists()) {
+                fileEntries[rawPath] = AnalyzeResult.FileEntry(rawPath, "not_found", emptyList())
+                continue
+            }
+
+            // Check CLI result cache
+            val cached = cliResultsCache[absolutePath]
+            if (cached != null && file.lastModified() == cached.lastModified && file.length() == cached.fileSize) {
+                fileEntries[rawPath] = AnalyzeResult.FileEntry(
+                    rawPath, cached.result.status, filterAndDedup(cached.result.problems, normalizedSeverity)
+                )
+                continue
+            }
+
+            // Try to resolve VirtualFile for editor-open check
+            val vf = LocalFileSystem.getInstance().findFileByPath(absolutePath.replace('\\', '/'))
+            if (vf != null) {
+                vfsResolvable.add(ResolvedFile(rawPath, absolutePath) to vf)
+            } else {
+                cliFiles.add(ResolvedFile(rawPath, absolutePath))
             }
         }
 
-        val normalizedSeverity = normalizeOptionalFilter(severity)
-        val filtered = if (normalizedSeverity != null) {
-            allProblems.filter { p ->
+        // Phase 2: Check which VFS-resolved files are open in the editor (one EDT call)
+        val openFiles = mutableListOf<Pair<ResolvedFile, com.intellij.openapi.vfs.VirtualFile>>()
+        if (vfsResolvable.isNotEmpty()) {
+            val openStatus = mutableMapOf<String, Boolean>()
+            ApplicationManager.getApplication().invokeAndWait {
+                val fem = FileEditorManager.getInstance(project)
+                for ((resolved, vf) in vfsResolvable) {
+                    openStatus[resolved.absolutePath] = fem.isFileOpen(vf)
+                }
+            }
+            for ((resolved, vf) in vfsResolvable) {
+                if (openStatus[resolved.absolutePath] == true) {
+                    openFiles.add(resolved to vf)
+                } else {
+                    cliFiles.add(resolved)
+                }
+            }
+        }
+
+        // Phase 3: Analyze open files individually (fast — reads from MarkupModel)
+        for ((resolved, vf) in openFiles) {
+            try {
+                val result = analyzeOpenFile(project, vf, resolved.absolutePath, timeoutMs)
+                fileEntries[resolved.rawPath] = AnalyzeResult.FileEntry(
+                    resolved.rawPath, result.status, filterAndDedup(result.problems, normalizedSeverity)
+                )
+            } catch (e: Exception) {
+                fileEntries[resolved.rawPath] = AnalyzeResult.FileEntry(
+                    resolved.rawPath, "error: ${e.message ?: "unknown"}", emptyList()
+                )
+            }
+        }
+
+        // Phase 4: Batch all CLI files into one jb inspectcode invocation
+        if (cliFiles.isNotEmpty()) {
+            try {
+                val batchResults = batchAnalyzeViaInspectCode(project, cliFiles.map { it.absolutePath }, timeoutMs)
+                for (resolved in cliFiles) {
+                    val result = batchResults[resolved.absolutePath] ?: FileAnalysisResult("ok", emptyList())
+                    fileEntries[resolved.rawPath] = AnalyzeResult.FileEntry(
+                        resolved.rawPath, result.status, filterAndDedup(result.problems, normalizedSeverity)
+                    )
+                }
+            } catch (e: Exception) {
+                for (resolved in cliFiles) {
+                    fileEntries[resolved.rawPath] = AnalyzeResult.FileEntry(
+                        resolved.rawPath, "error: ${e.message ?: "unknown"}", emptyList()
+                    )
+                }
+            }
+        }
+
+        // Maintain original request order
+        val ordered = filePaths.mapNotNull { fileEntries[it] }
+        return AnalyzeResult(project.name, ordered, severity)
+    }
+
+    private fun filterAndDedup(
+        problems: List<Map<String, Any>>,
+        normalizedSeverity: String?,
+    ): List<Map<String, Any>> {
+        val seen = LinkedHashSet<String>()
+        val deduped = problems.filter { problem ->
+            val key = listOf(
+                problem["severity"],
+                problem["inspectionType"],
+                problem["file"],
+                problem["line"],
+                problem["column"],
+                problem["description"],
+            ).joinToString("|")
+            seen.add(key)
+        }
+        return if (normalizedSeverity != null) {
+            deduped.filter { p ->
                 (p["severity"] as? String)?.equals(normalizedSeverity, ignoreCase = true) == true
             }
         } else {
-            allProblems
+            deduped
         }
+    }
 
-        val total = filtered.size
+    private fun formatAnalyzeResultAsJson(
+        result: AnalyzeResult,
+        limit: Int,
+        offset: Int,
+    ): String {
+        val allProblems = result.fileResults.flatMap { it.problems }
+        val total = allProblems.size
         val safeOffset = offset.coerceAtLeast(0).coerceAtMost(total)
         val safeLimit = limit.coerceAtLeast(1)
-        val page = filtered.drop(safeOffset).take(safeLimit)
+        val page = allProblems.drop(safeOffset).take(safeLimit)
         val hasMore = safeOffset + page.size < total
+
+        val fileStatuses = mutableMapOf<String, String>()
+        for (entry in result.fileResults) {
+            fileStatuses[entry.rawPath] = entry.status
+        }
 
         val response = mapOf(
             "status" to "results_available",
-            "project" to project.name,
+            "project" to result.projectName,
             "timestamp" to System.currentTimeMillis(),
             "method" to "highlight_analysis",
             "total_problems" to total,
@@ -1125,11 +1241,38 @@ class InspectionHandler : HttpRequestHandler() {
                 "has_more" to hasMore,
             ),
             "filters" to mapOf(
-                "severity" to (severity),
+                "severity" to result.severity,
             ),
             "files" to fileStatuses,
         )
         return formatJsonManually(response)
+    }
+
+    private fun formatAnalyzeResultAsMarkdown(result: AnalyzeResult): String {
+        val sb = StringBuilder()
+        for (entry in result.fileResults) {
+            sb.append("## ").append(entry.rawPath).append('\n')
+            if (entry.status == "not_found") {
+                sb.append("file not found\n")
+            } else if (entry.status.startsWith("error:")) {
+                sb.append(entry.status).append('\n')
+            } else if (entry.problems.isEmpty()) {
+                sb.append("no problems found\n")
+            } else {
+                for (problem in entry.problems) {
+                    val sev = problem["severity"] ?: "info"
+                    val desc = problem["description"] ?: ""
+                    val line = problem["line"]
+                    sb.append("- ").append(sev).append(": ").append(desc)
+                    if (line != null && line != 0) {
+                        sb.append(" (line ").append(line).append(')')
+                    }
+                    sb.append('\n')
+                }
+            }
+            sb.append('\n')
+        }
+        return sb.toString().trimEnd()
     }
 
     private data class FileAnalysisResult(
@@ -1144,37 +1287,6 @@ class InspectionHandler : HttpRequestHandler() {
     )
 
     private val cliResultsCache = ConcurrentHashMap<String, CliCacheEntry>()
-
-    private fun analyzeOneFile(
-        project: Project,
-        absolutePath: String,
-        timeoutMs: Long,
-    ): FileAnalysisResult {
-        // Resolve VirtualFile -- try VFS cache first, then refresh
-        var vf = LocalFileSystem.getInstance().findFileByPath(absolutePath.replace('\\', '/'))
-        if (vf == null) {
-            VirtualFileManager.getInstance().syncRefresh()
-            vf = LocalFileSystem.getInstance().findFileByPath(absolutePath.replace('\\', '/'))
-        }
-        if (vf == null) {
-            return FileAnalysisResult("not_found", emptyList())
-        }
-
-        val virtualFile = vf
-
-        // Dispatch: if the file is already open in the editor, read highlights from the
-        // MarkupModel (instant, no disruption). Otherwise, shell out to jb inspectcode.
-        val isOpen = AtomicReference(false)
-        ApplicationManager.getApplication().invokeAndWait {
-            isOpen.set(FileEditorManager.getInstance(project).isFileOpen(virtualFile))
-        }
-
-        return if (isOpen.get()) {
-            analyzeOpenFile(project, virtualFile, absolutePath, timeoutMs)
-        } else {
-            analyzeViaInspectCode(project, absolutePath, timeoutMs)
-        }
-    }
 
     /**
      * Fast path: the file is already open in the editor, so highlights are populated.
@@ -1218,44 +1330,40 @@ class InspectionHandler : HttpRequestHandler() {
     }
 
     /**
-     * CLI path: run `jb inspectcode` for files not open in the editor.
-     * Parses the SARIF output and maps to the same problem schema.
+     * CLI path: run a single `jb inspectcode` for multiple files not open in the editor.
+     * Uses semicolon-separated --include patterns so all files are analyzed in one invocation.
+     * Parses the SARIF output and splits results back per file.
      */
-    private fun analyzeViaInspectCode(
+    private fun batchAnalyzeViaInspectCode(
         project: Project,
-        absolutePath: String,
+        absolutePaths: List<String>,
         timeoutMs: Long,
-    ): FileAnalysisResult {
-        // Check CLI result cache -- return instantly if file hasn't changed
-        val file = File(absolutePath)
-        if (file.exists()) {
-            val cached = cliResultsCache[absolutePath]
-            if (cached != null && file.lastModified() == cached.lastModified && file.length() == cached.fileSize) {
-                return cached.result
+    ): Map<String, FileAnalysisResult> {
+        val jbExe = findJbExecutable()
+            ?: return absolutePaths.associateWith {
+                FileAnalysisResult("error: jb CLI not found (install via dotnet tool install -g JetBrains.ReSharper.GlobalTools)", emptyList())
+            }
+
+        val slnFile = findSolutionFile(project)
+            ?: return absolutePaths.associateWith {
+                FileAnalysisResult("error: no .sln file found for project", emptyList())
+            }
+
+        val slnDir = slnFile.parentFile
+
+        // Build semicolon-separated relative paths for --include
+        val includeArg = absolutePaths.joinToString(";") { absPath ->
+            try {
+                slnDir.toPath().relativize(Paths.get(absPath)).toString().replace('\\', '/')
+            } catch (_: Exception) {
+                absPath
             }
         }
 
-        val jbExe = findJbExecutable()
-            ?: return FileAnalysisResult("error: jb CLI not found (install via dotnet tool install -g JetBrains.ReSharper.GlobalTools)", emptyList())
-
-        val slnFile = findSolutionFile(project)
-            ?: return FileAnalysisResult("error: no .sln file found for project", emptyList())
-
-        // Build a relative path for --include
-        val slnDir = slnFile.parentFile
-        val relativePath = try {
-            slnDir.toPath().relativize(Paths.get(absolutePath)).toString().replace('\\', '/')
-        } catch (_: Exception) {
-            absolutePath
-        }
-
-        // Use a temp file in the scratchpad directory for SARIF output
         val scratchDir = File(System.getProperty("java.io.tmpdir"), "claude-inspectcode")
         scratchDir.mkdirs()
-        val hash = absolutePath.hashCode().toUInt().toString(16)
+        val hash = absolutePaths.joinToString("|").hashCode().toUInt().toString(16)
         val outputFile = File(scratchDir, "inspectcode-$hash.json")
-
-        // Persistent cache directory for the solution model
         val cachesHome = File(System.getProperty("user.home"), ".jb-inspectcode-cache")
 
         try {
@@ -1265,7 +1373,7 @@ class InspectionHandler : HttpRequestHandler() {
                 slnFile.absolutePath,
                 "--output=${outputFile.absolutePath}",
                 "--format=Sarif",
-                "--include=$relativePath",
+                "--include=$includeArg",
                 "--no-build",
                 "--no-swea",
                 "--caches-home=${cachesHome.absolutePath}",
@@ -1283,32 +1391,38 @@ class InspectionHandler : HttpRequestHandler() {
             val finished = process.waitFor(timeoutMs, TimeUnit.MILLISECONDS)
             if (!finished) {
                 process.destroyForcibly()
-                return FileAnalysisResult("timeout", emptyList())
+                return absolutePaths.associateWith { FileAnalysisResult("timeout", emptyList()) }
             }
 
             if (!outputFile.exists()) {
-                return FileAnalysisResult(
-                    "error: inspectcode produced no output (exit code ${process.exitValue()})",
-                    emptyList()
-                )
+                val errorMsg = "error: inspectcode produced no output (exit code ${process.exitValue()})"
+                return absolutePaths.associateWith { FileAnalysisResult(errorMsg, emptyList()) }
             }
 
             val sarifContent = outputFile.readText(Charsets.UTF_8)
-            val problems = parseSarifResults(sarifContent, absolutePath)
-            val result = FileAnalysisResult("ok", problems)
+            val problemsByFile = parseSarifResultsByFile(sarifContent, slnDir)
 
-            // Store in CLI result cache for future requests
-            if (file.exists()) {
-                cliResultsCache[absolutePath] = CliCacheEntry(
-                    lastModified = file.lastModified(),
-                    fileSize = file.length(),
-                    result = result,
-                )
+            // Build per-file results and update cache
+            val results = mutableMapOf<String, FileAnalysisResult>()
+            for (absPath in absolutePaths) {
+                val problems = problemsByFile[absPath] ?: emptyList()
+                val result = FileAnalysisResult("ok", problems)
+                results[absPath] = result
+
+                val file = File(absPath)
+                if (file.exists()) {
+                    cliResultsCache[absPath] = CliCacheEntry(
+                        lastModified = file.lastModified(),
+                        fileSize = file.length(),
+                        result = result,
+                    )
+                }
             }
-
-            return result
+            return results
         } catch (e: Exception) {
-            return FileAnalysisResult("error: ${e.message ?: "inspectcode failed"}", emptyList())
+            return absolutePaths.associateWith {
+                FileAnalysisResult("error: ${e.message ?: "inspectcode failed"}", emptyList())
+            }
         } finally {
             try { outputFile.delete() } catch (_: Exception) {}
         }
@@ -1376,15 +1490,23 @@ class InspectionHandler : HttpRequestHandler() {
 
     private val sarifParser = Json { ignoreUnknownKeys = true }
 
-    private fun parseSarifResults(sarifJson: String, absolutePath: String): List<Map<String, Any>> {
-        val problems = mutableListOf<Map<String, Any>>()
+    /**
+     * Parses SARIF JSON and groups results by resolved absolute file path.
+     * Each result's file is extracted from physicalLocation.artifactLocation.uri
+     * and resolved against [slnDir].
+     */
+    private fun parseSarifResultsByFile(
+        sarifJson: String,
+        slnDir: File,
+    ): Map<String, List<Map<String, Any>>> {
+        val problemsByFile = mutableMapOf<String, MutableList<Map<String, Any>>>()
         try {
             val root = sarifParser.parseToJsonElement(sarifJson).jsonObject
-            val runs = root["runs"]?.jsonArray ?: return emptyList()
-            if (runs.isEmpty()) return emptyList()
+            val runs = root["runs"]?.jsonArray ?: return emptyMap()
+            if (runs.isEmpty()) return emptyMap()
 
             val run = runs[0].jsonObject
-            val results = run["results"]?.jsonArray ?: return emptyList()
+            val results = run["results"]?.jsonArray ?: return emptyMap()
 
             // Build ruleId -> rule info lookup from tool.driver.rules
             val ruleMap = mutableMapOf<String, kotlinx.serialization.json.JsonObject>()
@@ -1409,10 +1531,13 @@ class InspectionHandler : HttpRequestHandler() {
 
                 var line = 0
                 var column = 0
+                var fileUri: String? = null
                 try {
                     val locations = result["locations"]?.jsonArray
                     if (locations != null && locations.isNotEmpty()) {
                         val physLoc = locations[0].jsonObject["physicalLocation"]?.jsonObject
+                        fileUri = physLoc?.get("artifactLocation")?.jsonObject
+                            ?.get("uri")?.jsonPrimitive?.contentOrNull
                         val region = physLoc?.get("region")?.jsonObject
                         if (region != null) {
                             line = region["startLine"]?.jsonPrimitive?.intOrNull ?: 0
@@ -1420,6 +1545,15 @@ class InspectionHandler : HttpRequestHandler() {
                         }
                     }
                 } catch (_: Exception) {}
+
+                // Resolve SARIF URI to absolute path
+                val absolutePath = if (fileUri != null) {
+                    try {
+                        slnDir.toPath().resolve(fileUri).normalize().toAbsolutePath().toString()
+                    } catch (_: Exception) { fileUri }
+                } else {
+                    "unknown"
+                }
 
                 // Map severity: check properties.ideaSeverity first, then SARIF level
                 val properties = try { result["properties"]?.jsonObject } catch (_: Exception) { null }
@@ -1439,7 +1573,7 @@ class InspectionHandler : HttpRequestHandler() {
                     }
                 } catch (_: Exception) { ruleId }
 
-                problems.add(
+                problemsByFile.getOrPut(absolutePath) { mutableListOf() }.add(
                     mapOf(
                         "description" to messageText,
                         "file" to absolutePath,
@@ -1456,7 +1590,7 @@ class InspectionHandler : HttpRequestHandler() {
         } catch (_: Exception) {
             // If SARIF parsing fails completely, return empty
         }
-        return problems
+        return problemsByFile
     }
 
     private fun mapSarifSeverity(level: String, ideaSeverity: String?): String {
@@ -1612,9 +1746,18 @@ class InspectionHandler : HttpRequestHandler() {
         jsonContent: String,
         status: HttpResponseStatus = HttpResponseStatus.OK,
     ) {
-        val content = Unpooled.copiedBuffer(jsonContent, Charsets.UTF_8)
+        sendResponse(context, jsonContent, "application/json", status)
+    }
+
+    private fun sendResponse(
+        context: ChannelHandlerContext,
+        body: String,
+        contentType: String,
+        status: HttpResponseStatus = HttpResponseStatus.OK,
+    ) {
+        val content = Unpooled.copiedBuffer(body, Charsets.UTF_8)
         val response = DefaultFullHttpResponse(HttpVersion.HTTP_1_1, status, content)
-        response.headers()[HttpHeaderNames.CONTENT_TYPE] = "application/json"
+        response.headers()[HttpHeaderNames.CONTENT_TYPE] = contentType
         response.headers()[HttpHeaderNames.CONTENT_LENGTH] = content.readableBytes()
         response.headers()[HttpHeaderNames.ACCESS_CONTROL_ALLOW_ORIGIN] = "*"
         context.writeAndFlush(response)
