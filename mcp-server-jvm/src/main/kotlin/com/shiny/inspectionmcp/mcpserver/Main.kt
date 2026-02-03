@@ -115,7 +115,7 @@ private fun handleRequest(element: JsonElement, toolExecutor: ToolExecutor): Jso
                 put(
                     "instructions",
                     JsonPrimitive(
-                        "For Rider or targeted file analysis: use inspection_analyze (single synchronous call, reads editor highlights including ReSharper results). " +
+                        "For Rider or targeted file analysis: use inspection_analyze (single synchronous call; open files use editor highlights, closed files use ReSharper CLI). " +
                             "For full project inspections: inspection_trigger -> inspection_wait (blocks; preferred) or poll inspection_get_status -> inspection_get_problems."
                     )
                 )
@@ -220,8 +220,9 @@ internal class ToolExecutor(
                     put(
                         "description",
                         JsonPrimitive(
-                            "Synchronous file analysis via editor highlights. " +
-                                "Opens files, waits for daemon/ReSharper analysis, and returns problems from the markup model. " +
+                            "Synchronous file analysis. " +
+                                "Files already open in the editor are analyzed instantly via the markup model. " +
+                                "Files not open are analyzed via the ReSharper CLI (jb inspectcode) with no editor disruption. " +
                                 "Best for Rider (C++ / ReSharper inspections) and targeted file analysis in any JetBrains IDE. " +
                                 "Returns results in one call -- no trigger/wait/poll needed."
                         )

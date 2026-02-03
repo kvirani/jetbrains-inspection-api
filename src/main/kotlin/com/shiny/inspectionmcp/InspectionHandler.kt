@@ -31,7 +31,15 @@ import io.netty.buffer.Unpooled
 import io.netty.channel.ChannelHandlerContext
 import io.netty.handler.codec.http.*
 import org.jetbrains.ide.HttpRequestHandler
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.contentOrNull
+import kotlinx.serialization.json.intOrNull
+import kotlinx.serialization.json.jsonArray
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
+import java.io.File
 import java.nio.file.Paths
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicReference
 
@@ -1129,6 +1137,14 @@ class InspectionHandler : HttpRequestHandler() {
         val problems: List<Map<String, Any>>,
     )
 
+    private data class CliCacheEntry(
+        val lastModified: Long,
+        val fileSize: Long,
+        val result: FileAnalysisResult,
+    )
+
+    private val cliResultsCache = ConcurrentHashMap<String, CliCacheEntry>()
+
     private fun analyzeOneFile(
         project: Project,
         absolutePath: String,
@@ -1146,23 +1162,33 @@ class InspectionHandler : HttpRequestHandler() {
 
         val virtualFile = vf
 
-        // ReSharper only populates the markup model for files open in an editor.
-        // If the file isn't already open, we open it briefly for analysis, immediately
-        // re-select the user's previous tab, then close it when done.
+        // Dispatch: if the file is already open in the editor, read highlights from the
+        // MarkupModel (instant, no disruption). Otherwise, shell out to jb inspectcode.
+        val isOpen = AtomicReference(false)
+        ApplicationManager.getApplication().invokeAndWait {
+            isOpen.set(FileEditorManager.getInstance(project).isFileOpen(virtualFile))
+        }
+
+        return if (isOpen.get()) {
+            analyzeOpenFile(project, virtualFile, absolutePath, timeoutMs)
+        } else {
+            analyzeViaInspectCode(project, absolutePath, timeoutMs)
+        }
+    }
+
+    /**
+     * Fast path: the file is already open in the editor, so highlights are populated.
+     * Read the MarkupModel directly -- no tab manipulation needed.
+     */
+    private fun analyzeOpenFile(
+        project: Project,
+        virtualFile: com.intellij.openapi.vfs.VirtualFile,
+        absolutePath: String,
+        timeoutMs: Long,
+    ): FileAnalysisResult {
         val docRef = AtomicReference<Document?>(null)
         val psiRef = AtomicReference<PsiFile?>(null)
-        val wasAlreadyOpen = AtomicReference(false)
         ApplicationManager.getApplication().invokeAndWait {
-            val fem = FileEditorManager.getInstance(project)
-            wasAlreadyOpen.set(fem.isFileOpen(virtualFile))
-            if (!wasAlreadyOpen.get()) {
-                val previousFile = fem.selectedFiles.firstOrNull()
-                fem.openFile(virtualFile, false)
-                // Immediately re-select the user's active tab so they aren't interrupted
-                if (previousFile != null) {
-                    fem.openFile(previousFile, false)
-                }
-            }
             val doc = FileDocumentManager.getInstance().getDocument(virtualFile)
             docRef.set(doc)
             if (doc != null) {
@@ -1181,23 +1207,281 @@ class InspectionHandler : HttpRequestHandler() {
         val psiFile = psiRef.get()
             ?: return FileAnalysisResult("error: could not resolve PSI", emptyList())
 
-        // Wait for analysis to complete
         val analysisOk = waitForAnalysisComplete(project, psiFile, document, timeoutMs)
         val status = if (analysisOk) "ok" else "timeout"
 
-        // Extract highlights
         val problems = ReadAction.compute<List<Map<String, Any>>, Exception> {
             extractHighlightsFromDocument(document, project, absolutePath)
         }
 
-        // Close the file if we opened it, to restore the user's editor state
-        if (!wasAlreadyOpen.get()) {
-            ApplicationManager.getApplication().invokeLater {
-                FileEditorManager.getInstance(project).closeFile(virtualFile)
+        return FileAnalysisResult(status, problems)
+    }
+
+    /**
+     * CLI path: run `jb inspectcode` for files not open in the editor.
+     * Parses the SARIF output and maps to the same problem schema.
+     */
+    private fun analyzeViaInspectCode(
+        project: Project,
+        absolutePath: String,
+        timeoutMs: Long,
+    ): FileAnalysisResult {
+        // Check CLI result cache -- return instantly if file hasn't changed
+        val file = File(absolutePath)
+        if (file.exists()) {
+            val cached = cliResultsCache[absolutePath]
+            if (cached != null && file.lastModified() == cached.lastModified && file.length() == cached.fileSize) {
+                return cached.result
             }
         }
 
-        return FileAnalysisResult(status, problems)
+        val jbExe = findJbExecutable()
+            ?: return FileAnalysisResult("error: jb CLI not found (install via dotnet tool install -g JetBrains.ReSharper.GlobalTools)", emptyList())
+
+        val slnFile = findSolutionFile(project)
+            ?: return FileAnalysisResult("error: no .sln file found for project", emptyList())
+
+        // Build a relative path for --include
+        val slnDir = slnFile.parentFile
+        val relativePath = try {
+            slnDir.toPath().relativize(Paths.get(absolutePath)).toString().replace('\\', '/')
+        } catch (_: Exception) {
+            absolutePath
+        }
+
+        // Use a temp file in the scratchpad directory for SARIF output
+        val scratchDir = File(System.getProperty("java.io.tmpdir"), "claude-inspectcode")
+        scratchDir.mkdirs()
+        val hash = absolutePath.hashCode().toUInt().toString(16)
+        val outputFile = File(scratchDir, "inspectcode-$hash.json")
+
+        // Persistent cache directory for the solution model
+        val cachesHome = File(System.getProperty("user.home"), ".jb-inspectcode-cache")
+
+        try {
+            val command = listOf(
+                jbExe,
+                "inspectcode",
+                slnFile.absolutePath,
+                "--output=${outputFile.absolutePath}",
+                "--format=Sarif",
+                "--include=$relativePath",
+                "--no-build",
+                "--no-swea",
+                "--caches-home=${cachesHome.absolutePath}",
+                "--severity=INFO",
+                "--verbosity=WARN",
+            )
+
+            val pb = ProcessBuilder(command)
+            pb.directory(slnDir)
+            pb.redirectErrorStream(true)
+            val process = pb.start()
+
+            // Drain stdout/stderr to avoid blocking
+            val processOutput = process.inputStream.bufferedReader().readText()
+            val finished = process.waitFor(timeoutMs, TimeUnit.MILLISECONDS)
+            if (!finished) {
+                process.destroyForcibly()
+                return FileAnalysisResult("timeout", emptyList())
+            }
+
+            if (!outputFile.exists()) {
+                return FileAnalysisResult(
+                    "error: inspectcode produced no output (exit code ${process.exitValue()})",
+                    emptyList()
+                )
+            }
+
+            val sarifContent = outputFile.readText(Charsets.UTF_8)
+            val problems = parseSarifResults(sarifContent, absolutePath)
+            val result = FileAnalysisResult("ok", problems)
+
+            // Store in CLI result cache for future requests
+            if (file.exists()) {
+                cliResultsCache[absolutePath] = CliCacheEntry(
+                    lastModified = file.lastModified(),
+                    fileSize = file.length(),
+                    result = result,
+                )
+            }
+
+            return result
+        } catch (e: Exception) {
+            return FileAnalysisResult("error: ${e.message ?: "inspectcode failed"}", emptyList())
+        } finally {
+            try { outputFile.delete() } catch (_: Exception) {}
+        }
+    }
+
+    // Cache .sln per project (won't change during a session)
+    private val solutionFileCache = ConcurrentHashMap<String, File?>()
+
+    private fun findSolutionFile(project: Project): File? {
+        val key = project.name + "|" + (project.basePath ?: "")
+        return solutionFileCache.getOrPut(key) { searchForSolutionFile(project) }
+    }
+
+    private fun searchForSolutionFile(project: Project): File? {
+        val basePath = project.basePath ?: return null
+        var dir: File? = File(basePath)
+        var levels = 0
+        val projectName = project.name
+
+        while (dir != null && levels <= 3) {
+            val slnFiles = dir.listFiles { f -> f.isFile && f.extension.equals("sln", ignoreCase = true) }
+            if (slnFiles != null && slnFiles.isNotEmpty()) {
+                if (slnFiles.size == 1) return slnFiles[0]
+                // Prefer the one matching the project name
+                val preferred = slnFiles.firstOrNull { it.nameWithoutExtension.equals(projectName, ignoreCase = true) }
+                return preferred ?: slnFiles[0]
+            }
+            dir = dir.parentFile
+            levels++
+        }
+        return null
+    }
+
+    private fun findJbExecutable(): String? {
+        // Check if `jb` is on PATH
+        val jbNames = if (System.getProperty("os.name").lowercase().contains("win")) {
+            listOf("jb.exe", "jb.cmd", "jb.bat", "jb")
+        } else {
+            listOf("jb")
+        }
+
+        val pathDirs = System.getenv("PATH")?.split(File.pathSeparator) ?: emptyList()
+        for (dir in pathDirs) {
+            for (name in jbNames) {
+                val candidate = File(dir, name)
+                if (candidate.exists() && candidate.canExecute()) {
+                    return candidate.absolutePath
+                }
+            }
+        }
+
+        // Well-known locations
+        val home = System.getProperty("user.home") ?: return null
+        val wellKnown = listOf(
+            Paths.get(home, ".dotnet", "tools", "jb").toString(),
+            Paths.get(home, ".dotnet", "tools", "jb.exe").toString(),
+        )
+        for (path in wellKnown) {
+            val f = File(path)
+            if (f.exists()) return f.absolutePath
+        }
+
+        return null
+    }
+
+    private val sarifParser = Json { ignoreUnknownKeys = true }
+
+    private fun parseSarifResults(sarifJson: String, absolutePath: String): List<Map<String, Any>> {
+        val problems = mutableListOf<Map<String, Any>>()
+        try {
+            val root = sarifParser.parseToJsonElement(sarifJson).jsonObject
+            val runs = root["runs"]?.jsonArray ?: return emptyList()
+            if (runs.isEmpty()) return emptyList()
+
+            val run = runs[0].jsonObject
+            val results = run["results"]?.jsonArray ?: return emptyList()
+
+            // Build ruleId -> rule info lookup from tool.driver.rules
+            val ruleMap = mutableMapOf<String, kotlinx.serialization.json.JsonObject>()
+            try {
+                val driver = run["tool"]?.jsonObject?.get("driver")?.jsonObject
+                val rules = driver?.get("rules")?.jsonArray
+                if (rules != null) {
+                    for (rule in rules) {
+                        val ruleObj = rule.jsonObject
+                        val id = ruleObj["id"]?.jsonPrimitive?.contentOrNull
+                        if (id != null) ruleMap[id] = ruleObj
+                    }
+                }
+            } catch (_: Exception) {}
+
+            for (resultElement in results) {
+                val result = resultElement.jsonObject
+
+                val ruleId = result["ruleId"]?.jsonPrimitive?.contentOrNull ?: "unknown"
+                val level = result["level"]?.jsonPrimitive?.contentOrNull ?: "warning"
+                val messageText = result["message"]?.jsonObject?.get("text")?.jsonPrimitive?.contentOrNull ?: ""
+
+                var line = 0
+                var column = 0
+                try {
+                    val locations = result["locations"]?.jsonArray
+                    if (locations != null && locations.isNotEmpty()) {
+                        val physLoc = locations[0].jsonObject["physicalLocation"]?.jsonObject
+                        val region = physLoc?.get("region")?.jsonObject
+                        if (region != null) {
+                            line = region["startLine"]?.jsonPrimitive?.intOrNull ?: 0
+                            column = region["startColumn"]?.jsonPrimitive?.intOrNull ?: 0
+                        }
+                    }
+                } catch (_: Exception) {}
+
+                // Map severity: check properties.ideaSeverity first, then SARIF level
+                val properties = try { result["properties"]?.jsonObject } catch (_: Exception) { null }
+                val ideaSeverity = properties?.get("ideaSeverity")?.jsonPrimitive?.contentOrNull
+                val severity = mapSarifSeverity(level, ideaSeverity)
+
+                // Category from rule lookup or ruleId
+                val category = try {
+                    val ruleInfo = ruleMap[ruleId]
+                    val relationships = ruleInfo?.get("relationships")?.jsonArray
+                    if (relationships != null && relationships.isNotEmpty()) {
+                        val target = relationships[0].jsonObject["target"]?.jsonObject
+                        val toolComponent = target?.get("toolComponent")?.jsonObject
+                        toolComponent?.get("name")?.jsonPrimitive?.contentOrNull ?: ruleId
+                    } else {
+                        ruleId
+                    }
+                } catch (_: Exception) { ruleId }
+
+                problems.add(
+                    mapOf(
+                        "description" to messageText,
+                        "file" to absolutePath,
+                        "line" to line,
+                        "column" to column,
+                        "severity" to severity,
+                        "category" to category,
+                        "inspectionType" to ruleId,
+                        "source" to "inspectcode_cli",
+                        "locationKnown" to true,
+                    )
+                )
+            }
+        } catch (_: Exception) {
+            // If SARIF parsing fails completely, return empty
+        }
+        return problems
+    }
+
+    private fun mapSarifSeverity(level: String, ideaSeverity: String?): String {
+        // Prefer IDEA severity if available
+        if (ideaSeverity != null) {
+            return when (ideaSeverity.uppercase()) {
+                "ERROR" -> "error"
+                "WARNING" -> "warning"
+                "WEAK WARNING" -> "weak_warning"
+                "SUGGESTION" -> "weak_warning"
+                "HINT" -> "info"
+                "INFORMATION" -> "info"
+                else -> mapSarifLevel(level)
+            }
+        }
+        return mapSarifLevel(level)
+    }
+
+    private fun mapSarifLevel(level: String): String {
+        return when (level.lowercase()) {
+            "error" -> "error"
+            "warning" -> "warning"
+            "note" -> "weak_warning"
+            else -> "info"
+        }
     }
 
     private fun waitForAnalysisComplete(
