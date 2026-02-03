@@ -38,7 +38,12 @@ dependencies {
     testImplementation("org.assertj:assertj-core:3.24.2")
     
     intellijPlatform {
-        intellijIdea("2025.1.1")
+        val idePath = providers.gradleProperty("localIdePath").orNull
+        if (idePath != null) {
+            local(idePath)
+        } else {
+            intellijIdea("2025.1.1")
+        }
         pluginVerifier()
         zipSigner()
         testFramework(TestFrameworkType.Platform)

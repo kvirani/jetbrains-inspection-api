@@ -114,7 +114,10 @@ private fun handleRequest(element: JsonElement, toolExecutor: ToolExecutor): Jso
                 })
                 put(
                     "instructions",
-                    JsonPrimitive("Workflow: inspection_trigger -> inspection_wait (blocks; preferred) or poll inspection_get_status -> inspection_get_problems.")
+                    JsonPrimitive(
+                        "For Rider or targeted file analysis: use inspection_analyze (single synchronous call, reads editor highlights including ReSharper results). " +
+                            "For full project inspections: inspection_trigger -> inspection_wait (blocks; preferred) or poll inspection_get_status -> inspection_get_problems."
+                    )
                 )
             }
             successResponse(id, result)
@@ -211,6 +214,19 @@ internal class ToolExecutor(
                         )
                     )
                     put("inputSchema", waitSchema())
+                },
+                buildJsonObject {
+                    put("name", JsonPrimitive("inspection_analyze"))
+                    put(
+                        "description",
+                        JsonPrimitive(
+                            "Synchronous file analysis via editor highlights. " +
+                                "Opens files, waits for daemon/ReSharper analysis, and returns problems from the markup model. " +
+                                "Best for Rider (C++ / ReSharper inspections) and targeted file analysis in any JetBrains IDE. " +
+                                "Returns results in one call -- no trigger/wait/poll needed."
+                        )
+                    )
+                    put("inputSchema", analyzeSchema())
                 }
             )
         )
@@ -228,6 +244,7 @@ internal class ToolExecutor(
             "inspection_trigger" -> handleTrigger(args)
             "inspection_get_status" -> handleGetStatus(args)
             "inspection_wait" -> handleWait(args)
+            "inspection_analyze" -> handleAnalyze(args)
             else -> toolError("Unknown tool: $name")
         }
     }
@@ -329,6 +346,80 @@ internal class ToolExecutor(
         } catch (error: Exception) {
             toolError("Error waiting for inspection: ${error.message}")
         }
+    }
+
+    private fun handleAnalyze(args: JsonObject): JsonObject {
+        return try {
+            val files = args["files"]?.let { element ->
+                when (element) {
+                    is JsonArray -> element.mapNotNull { (it as? JsonPrimitive)?.contentOrNull }
+                    is JsonPrimitive -> element.contentOrNull?.let { listOf(it) }
+                    else -> null
+                }
+            }
+            if (files.isNullOrEmpty()) {
+                return toolError("'files' parameter is required and must be a non-empty array of file paths.")
+            }
+
+            val params = mutableListOf<Pair<String, String>>()
+            files.forEach { params += "file" to it }
+            args.string("project")?.let { params += "project" to it }
+            val severity = args.string("severity") ?: "all"
+            params += "severity" to severity
+            val timeoutMs = args.int("timeout_ms") ?: 30000
+            params += "timeout_ms" to timeoutMs.toString()
+            args.int("limit")?.let { params += "limit" to it.toString() }
+            args.int("offset")?.let { params += "offset" to it.toString() }
+
+            val url = buildUrl("$baseUrl/analyze", params)
+            // HTTP timeout = timeout_ms + 10s buffer since the endpoint blocks
+            val requestTimeoutSeconds = ((timeoutMs + 10000) / 1000).toLong().coerceAtLeast(15L)
+            val result = httpGet(url, requestTimeoutSeconds)
+
+            val guidance = buildAnalyzeGuidance(result)
+            val text = prettyJson.encodeToString(JsonElement.serializer(), result) + guidance
+            toolText(text)
+        } catch (error: Exception) {
+            toolError("Error analyzing files: ${error.message}")
+        }
+    }
+
+    private fun buildAnalyzeGuidance(result: JsonElement): String {
+        val obj = result as? JsonObject ?: return ""
+        val total = obj["total_problems"]?.jsonPrimitive?.intOrNull
+        val filesMap = obj["files"] as? JsonObject
+
+        val parts = mutableListOf<String>()
+
+        if (total != null) {
+            parts += if (total == 0) "OK: No problems found."
+            else "INFO: Found $total problem(s)."
+        }
+
+        if (filesMap != null) {
+            val notFound = filesMap.entries.filter {
+                (it.value as? JsonPrimitive)?.contentOrNull == "not_found"
+            }
+            val timedOut = filesMap.entries.filter {
+                (it.value as? JsonPrimitive)?.contentOrNull == "timeout"
+            }
+            if (notFound.isNotEmpty()) {
+                parts += "WARN: File(s) not found: ${notFound.joinToString(", ") { it.key }}"
+            }
+            if (timedOut.isNotEmpty()) {
+                parts += "WARN: Analysis timed out for: ${timedOut.joinToString(", ") { it.key }}. Increase timeout_ms or open the file in the editor first."
+            }
+        }
+
+        val pagination = obj["pagination"] as? JsonObject
+        val hasMore = pagination?.get("has_more")?.jsonPrimitive?.booleanOrNull == true
+        if (hasMore) {
+            val nextOffset = (obj["problems_shown"]?.jsonPrimitive?.intOrNull ?: 0) +
+                (pagination?.get("offset")?.jsonPrimitive?.intOrNull ?: 0)
+            parts += "NEXT: More results available. Use offset=$nextOffset to get the next page."
+        }
+
+        return if (parts.isEmpty()) "" else "\n\n" + parts.joinToString("\n")
     }
 
     private fun buildProblemsGuidance(result: JsonElement): String {
@@ -580,6 +671,27 @@ internal class ToolExecutor(
                     "poll_ms",
                     intProp("Poll interval ms", defaultValue = 1000)
                 )
+            })
+        }
+    }
+
+    private fun analyzeSchema(): JsonObject {
+        return buildJsonObject {
+            put("type", JsonPrimitive("object"))
+            put("required", JsonArray(listOf(JsonPrimitive("files"))))
+            put("properties", buildJsonObject {
+                put("files", buildJsonObject {
+                    put("type", JsonPrimitive("array"))
+                    put("description", JsonPrimitive("File paths to analyze (absolute or project-relative)"))
+                    put("items", buildJsonObject {
+                        put("type", JsonPrimitive("string"))
+                    })
+                })
+                put("project", stringProp("Project name (optional; defaults to focused project)"))
+                put("severity", stringProp("Filter: error | warning | weak_warning | info | all", defaultValue = "all"))
+                put("timeout_ms", intProp("Per-file analysis timeout in ms (1000-120000)", defaultValue = 30000))
+                put("limit", intProp("Max problems to return", defaultValue = 200))
+                put("offset", intProp("Pagination offset", defaultValue = 0))
             })
         }
     }

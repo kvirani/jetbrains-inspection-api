@@ -3,16 +3,25 @@ package com.shiny.inspectionmcp
 import com.intellij.analysis.AnalysisScope
 import com.intellij.codeInspection.InspectionManager
 import com.intellij.codeInspection.ui.InspectionResultsView
+import com.intellij.codeInsight.daemon.DaemonCodeAnalyzer
+import com.intellij.codeInsight.daemon.impl.DaemonCodeAnalyzerEx
+import com.intellij.codeInsight.daemon.impl.HighlightInfo
 import com.intellij.ide.DataManager
+import com.intellij.lang.annotation.HighlightSeverity
 import com.intellij.openapi.actionSystem.CommonDataKeys
 import com.intellij.openapi.application.ReadAction
 import com.intellij.openapi.application.ApplicationManager
+import com.intellij.openapi.editor.Document
+import com.intellij.openapi.editor.impl.DocumentMarkupModel
 import com.intellij.openapi.fileEditor.FileDocumentManager
+import com.intellij.openapi.fileEditor.FileEditorManager
 import com.intellij.openapi.project.Project
 import com.intellij.openapi.project.ProjectManager
 import com.intellij.openapi.vfs.LocalFileSystem
+import com.intellij.openapi.vfs.VirtualFileManager
 import com.intellij.openapi.wm.IdeFocusManager
 import com.intellij.openapi.wm.WindowManager
+import com.intellij.psi.PsiFile
 import com.intellij.psi.PsiManager
 import com.shiny.inspectionmcp.core.filterProblems
 import com.shiny.inspectionmcp.core.formatJsonManually
@@ -141,6 +150,30 @@ class InspectionHandler : HttpRequestHandler() {
                     val pollMs = urlDecoder.parameters()["poll_ms"]?.firstOrNull()?.toLongOrNull()
                     val result = waitForInspection(projectName, timeoutMs, pollMs)
                     sendJsonResponse(context, result)
+                }
+                "/api/inspection/analyze" -> {
+                    val projectName = urlDecoder.parameters()["project"]?.firstOrNull()
+                    val files = urlDecoder.parameters()["file"] ?: emptyList()
+                    val severity = urlDecoder.parameters()["severity"]?.firstOrNull() ?: "all"
+                    val timeoutMs = (urlDecoder.parameters()["timeout_ms"]?.firstOrNull()?.toLongOrNull() ?: 30000L)
+                        .coerceIn(1000L, 120000L)
+                    val limit = urlDecoder.parameters()["limit"]?.firstOrNull()?.toIntOrNull() ?: 200
+                    val offset = urlDecoder.parameters()["offset"]?.firstOrNull()?.toIntOrNull() ?: 0
+                    if (files.isEmpty()) {
+                        sendJsonResponse(
+                            context,
+                            """{"error": "At least one 'file' query parameter is required"}""",
+                            HttpResponseStatus.BAD_REQUEST
+                        )
+                    } else {
+                        val project = ReadAction.compute<Project?, Exception> { getCurrentProject(projectName) }
+                        if (project == null) {
+                            sendJsonResponse(context, """{"error": "No project found"}""", HttpResponseStatus.NOT_FOUND)
+                        } else {
+                            val result = analyzeFilesViaHighlights(project, files, severity, timeoutMs, limit, offset)
+                            sendJsonResponse(context, result)
+                        }
+                    }
                 }
                 else -> {
                     sendJsonResponse(context, """{"error": "Unknown endpoint"}""", HttpResponseStatus.NOT_FOUND)
@@ -1013,9 +1046,286 @@ class InspectionHandler : HttpRequestHandler() {
         )
     }
     
+    private fun analyzeFilesViaHighlights(
+        project: Project,
+        filePaths: List<String>,
+        severity: String,
+        timeoutMs: Long,
+        limit: Int,
+        offset: Int,
+    ): String {
+        val basePath = project.basePath
+        val allProblems = mutableListOf<Map<String, Any>>()
+        val fileStatuses = mutableMapOf<String, String>()
+        val seen = LinkedHashSet<String>()
+
+        for (rawPath in filePaths) {
+            val absolutePath = try {
+                val p = Paths.get(rawPath)
+                if (p.isAbsolute) rawPath
+                else if (!basePath.isNullOrBlank()) Paths.get(basePath, rawPath).normalize().toString()
+                else rawPath
+            } catch (_: Exception) { rawPath }
+
+            try {
+                val result = analyzeOneFile(project, absolutePath, timeoutMs)
+                fileStatuses[rawPath] = result.status
+                for (problem in result.problems) {
+                    val key = listOf(
+                        problem["severity"],
+                        problem["inspectionType"],
+                        problem["file"],
+                        problem["line"],
+                        problem["column"],
+                        problem["description"],
+                    ).joinToString("|")
+                    if (seen.add(key)) {
+                        allProblems.add(problem)
+                    }
+                }
+            } catch (e: Exception) {
+                fileStatuses[rawPath] = "error: ${e.message ?: "unknown"}"
+            }
+        }
+
+        val normalizedSeverity = normalizeOptionalFilter(severity)
+        val filtered = if (normalizedSeverity != null) {
+            allProblems.filter { p ->
+                (p["severity"] as? String)?.equals(normalizedSeverity, ignoreCase = true) == true
+            }
+        } else {
+            allProblems
+        }
+
+        val total = filtered.size
+        val safeOffset = offset.coerceAtLeast(0).coerceAtMost(total)
+        val safeLimit = limit.coerceAtLeast(1)
+        val page = filtered.drop(safeOffset).take(safeLimit)
+        val hasMore = safeOffset + page.size < total
+
+        val response = mapOf(
+            "status" to "results_available",
+            "project" to project.name,
+            "timestamp" to System.currentTimeMillis(),
+            "method" to "highlight_analysis",
+            "total_problems" to total,
+            "problems_shown" to page.size,
+            "problems" to page,
+            "pagination" to mapOf(
+                "limit" to safeLimit,
+                "offset" to safeOffset,
+                "has_more" to hasMore,
+            ),
+            "filters" to mapOf(
+                "severity" to (severity),
+            ),
+            "files" to fileStatuses,
+        )
+        return formatJsonManually(response)
+    }
+
+    private data class FileAnalysisResult(
+        val status: String,
+        val problems: List<Map<String, Any>>,
+    )
+
+    private fun analyzeOneFile(
+        project: Project,
+        absolutePath: String,
+        timeoutMs: Long,
+    ): FileAnalysisResult {
+        // Resolve VirtualFile -- try VFS cache first, then refresh
+        var vf = LocalFileSystem.getInstance().findFileByPath(absolutePath.replace('\\', '/'))
+        if (vf == null) {
+            VirtualFileManager.getInstance().syncRefresh()
+            vf = LocalFileSystem.getInstance().findFileByPath(absolutePath.replace('\\', '/'))
+        }
+        if (vf == null) {
+            return FileAnalysisResult("not_found", emptyList())
+        }
+
+        val virtualFile = vf
+
+        // ReSharper only populates the markup model for files open in an editor.
+        // If the file isn't already open, we open it briefly for analysis, immediately
+        // re-select the user's previous tab, then close it when done.
+        val docRef = AtomicReference<Document?>(null)
+        val psiRef = AtomicReference<PsiFile?>(null)
+        val wasAlreadyOpen = AtomicReference(false)
+        ApplicationManager.getApplication().invokeAndWait {
+            val fem = FileEditorManager.getInstance(project)
+            wasAlreadyOpen.set(fem.isFileOpen(virtualFile))
+            if (!wasAlreadyOpen.get()) {
+                val previousFile = fem.selectedFiles.firstOrNull()
+                fem.openFile(virtualFile, false)
+                // Immediately re-select the user's active tab so they aren't interrupted
+                if (previousFile != null) {
+                    fem.openFile(previousFile, false)
+                }
+            }
+            val doc = FileDocumentManager.getInstance().getDocument(virtualFile)
+            docRef.set(doc)
+            if (doc != null) {
+                val psi = ReadAction.compute<PsiFile?, Exception> {
+                    PsiManager.getInstance(project).findFile(virtualFile)
+                }
+                psiRef.set(psi)
+                if (psi != null) {
+                    DaemonCodeAnalyzer.getInstance(project).restart(psi)
+                }
+            }
+        }
+
+        val document = docRef.get()
+            ?: return FileAnalysisResult("error: could not load document", emptyList())
+        val psiFile = psiRef.get()
+            ?: return FileAnalysisResult("error: could not resolve PSI", emptyList())
+
+        // Wait for analysis to complete
+        val analysisOk = waitForAnalysisComplete(project, psiFile, document, timeoutMs)
+        val status = if (analysisOk) "ok" else "timeout"
+
+        // Extract highlights
+        val problems = ReadAction.compute<List<Map<String, Any>>, Exception> {
+            extractHighlightsFromDocument(document, project, absolutePath)
+        }
+
+        // Close the file if we opened it, to restore the user's editor state
+        if (!wasAlreadyOpen.get()) {
+            ApplicationManager.getApplication().invokeLater {
+                FileEditorManager.getInstance(project).closeFile(virtualFile)
+            }
+        }
+
+        return FileAnalysisResult(status, problems)
+    }
+
+    private fun waitForAnalysisComplete(
+        project: Project,
+        psiFile: PsiFile,
+        document: Document,
+        timeoutMs: Long,
+    ): Boolean {
+        val deadline = System.currentTimeMillis() + timeoutMs
+        val stabilizationMs = 2000L
+        var lastCount = -1
+        var stableSince = System.currentTimeMillis()
+
+        while (System.currentTimeMillis() < deadline) {
+            val finished = ReadAction.compute<Boolean, Exception> {
+                try {
+                    DaemonCodeAnalyzerEx.getInstanceEx(project).isErrorAnalyzingFinished(psiFile)
+                } catch (_: Exception) {
+                    false
+                }
+            }
+
+            if (finished) {
+                // Check highlight count stabilization
+                val currentCount = ReadAction.compute<Int, Exception> {
+                    try {
+                        val markup = DocumentMarkupModel.forDocument(document, project, false)
+                        markup?.allHighlighters?.size ?: 0
+                    } catch (_: Exception) { 0 }
+                }
+
+                if (currentCount != lastCount) {
+                    lastCount = currentCount
+                    stableSince = System.currentTimeMillis()
+                }
+
+                if (System.currentTimeMillis() - stableSince >= stabilizationMs) {
+                    return true
+                }
+            }
+
+            try {
+                Thread.sleep(250)
+            } catch (_: InterruptedException) {
+                return false
+            }
+        }
+        return false
+    }
+
+    private fun extractHighlightsFromDocument(
+        document: Document,
+        project: Project,
+        filePath: String,
+    ): List<Map<String, Any>> {
+        val markup = DocumentMarkupModel.forDocument(document, project, false)
+            ?: return emptyList()
+
+        val problems = mutableListOf<Map<String, Any>>()
+
+        for (highlighter in markup.allHighlighters) {
+            val info = HighlightInfo.fromRangeHighlighter(highlighter) ?: continue
+            if (!isInspectionHighlight(info)) continue
+
+            val startOffset = highlighter.startOffset
+            val line = document.getLineNumber(startOffset) + 1
+            val column = startOffset - document.getLineStartOffset(line - 1) + 1
+
+            val description = info.toolTip?.let { stripHtml(it) }
+                ?: info.description
+                ?: continue
+
+            val severityStr = mapHighlightSeverity(info.severity)
+            val inspectionId = info.inspectionToolId ?: info.type.toString()
+            val category = info.severity.displayName ?: info.severity.myName
+
+            problems.add(
+                mapOf(
+                    "description" to description,
+                    "file" to filePath,
+                    "line" to line,
+                    "column" to column,
+                    "severity" to severityStr,
+                    "category" to category,
+                    "inspectionType" to inspectionId,
+                    "source" to "highlight_analysis",
+                    "locationKnown" to true,
+                )
+            )
+        }
+
+        return problems
+    }
+
+    private fun isInspectionHighlight(info: HighlightInfo): Boolean {
+        // Accept if it has an inspection tool ID (IntelliJ-native inspections)
+        if (info.inspectionToolId != null) return true
+
+        // ReSharper diagnostics often lack inspectionToolId but have a tooltip/description.
+        // Accept any highlight with meaningful diagnostic text.
+        val hasContent = !info.toolTip.isNullOrBlank() || !info.description.isNullOrBlank()
+        if (!hasContent) return false
+
+        // Skip TODO highlights
+        if (info.type.toString().contains("TODO", ignoreCase = true)) return false
+
+        return true
+    }
+
+    private fun mapHighlightSeverity(severity: HighlightSeverity): String {
+        return when {
+            severity >= HighlightSeverity.ERROR -> "error"
+            severity >= HighlightSeverity.WARNING -> "warning"
+            severity >= HighlightSeverity.WEAK_WARNING -> "weak_warning"
+            else -> "info"
+        }
+    }
+
+    private fun stripHtml(html: String): String {
+        return html.replace(Regex("<[^>]*>"), "").replace("&nbsp;", " ")
+            .replace("&lt;", "<").replace("&gt;", ">")
+            .replace("&amp;", "&").replace("&quot;", "\"")
+            .trim()
+    }
+
     private fun sendJsonResponse(
-        context: ChannelHandlerContext, 
-        jsonContent: String, 
+        context: ChannelHandlerContext,
+        jsonContent: String,
         status: HttpResponseStatus = HttpResponseStatus.OK,
     ) {
         val content = Unpooled.copiedBuffer(jsonContent, Charsets.UTF_8)
